@@ -1,0 +1,217 @@
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { getShopifyConfig, createShopifySession } = require('../config/shopify');
+const { createShopRecord, getShopByDomain } = require('../config/supabase');
+const logger = require('../utils/logger');
+
+const router = express.Router();
+
+// Begin OAuth process
+router.get('/shopify', async (req, res) => {
+  try {
+    const { shop } = req.query;
+    
+    if (!shop) {
+      return res.status(400).json({ error: 'Shop parameter is required' });
+    }
+
+    // Validate shop domain format
+    const shopRegex = /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/;
+    if (!shopRegex.test(shop)) {
+      return res.status(400).json({ error: 'Invalid shop domain format' });
+    }
+
+    const shopify = getShopifyConfig();
+    
+    // Generate state parameter for security
+    const state = crypto.randomBytes(16).toString('hex');
+    
+    // Store state in session or cookie (simplified for this example)
+    res.cookie('oauth_state', state, { 
+      httpOnly: true, 
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 60000 // 1 minute
+    });
+
+    // Build authorization URL
+    const authUrl = shopify.auth.begin({
+      shop,
+      callbackPath: '/api/auth/shopify/callback',
+      isOnline: false, // Use offline access tokens for background processing
+      state
+    });
+
+    logger.info(`OAuth initiated for shop: ${shop}`);
+    res.redirect(authUrl);
+    
+  } catch (error) {
+    logger.error('OAuth initiation failed:', error);
+    res.status(500).json({ error: 'Failed to initiate OAuth' });
+  }
+});
+
+// OAuth callback handler
+router.get('/shopify/callback', async (req, res) => {
+  try {
+    const { shop, code, state, hmac } = req.query;
+    const storedState = req.cookies.oauth_state;
+
+    // Verify state parameter
+    if (!state || state !== storedState) {
+      return res.status(400).json({ error: 'Invalid state parameter' });
+    }
+
+    // Clear the state cookie
+    res.clearCookie('oauth_state');
+
+    const shopify = getShopifyConfig();
+    
+    // Exchange code for access token
+    const session = await shopify.auth.callback({
+      shop,
+      code,
+      hmac
+    });
+
+    // Save shop and token to database
+    const shopRecord = await createShopRecord(
+      shop, 
+      session.accessToken, 
+      session.scope
+    );
+
+    // Generate JWT token for our app
+    const appToken = jwt.sign(
+      { 
+        shopDomain: shop,
+        shopId: shopRecord.id,
+        scopes: session.scope
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    // Register webhooks for this shop
+    await registerWebhooksForShop(shop, session.accessToken);
+
+    logger.info(`OAuth completed for shop: ${shop}`);
+    
+    // Redirect to app with token
+    const redirectUrl = `${process.env.HOST_URL}/app?token=${appToken}&shop=${shop}`;
+    res.redirect(redirectUrl);
+    
+  } catch (error) {
+    logger.error('OAuth callback failed:', error);
+    res.status(500).json({ error: 'OAuth callback failed' });
+  }
+});
+
+// Verify JWT token middleware
+const verifyToken = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '') || 
+                  req.query.token;
+
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Verify shop still exists and is active
+    const shop = await getShopByDomain(decoded.shopDomain);
+    if (!shop) {
+      return res.status(401).json({ error: 'Shop not found or inactive' });
+    }
+
+    req.shop = shop;
+    req.user = decoded;
+    next();
+    
+  } catch (error) {
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired' });
+    }
+    
+    logger.error('Token verification failed:', error);
+    res.status(500).json({ error: 'Token verification failed' });
+  }
+};
+
+// Get shop info
+router.get('/shop', verifyToken, async (req, res) => {
+  try {
+    const shopify = getShopifyConfig();
+    const session = await createShopifySession(req.shop.domain, req.shop.access_token);
+    
+    const shopData = await shopify.rest.Shop.all({
+      session
+    });
+
+    res.json({
+      shop: shopData.data[0],
+      app_scopes: req.user.scopes
+    });
+    
+  } catch (error) {
+    logger.error('Failed to get shop info:', error);
+    res.status(500).json({ error: 'Failed to retrieve shop information' });
+  }
+});
+
+// Refresh webhooks (for troubleshooting)
+router.post('/refresh-webhooks', verifyToken, async (req, res) => {
+  try {
+    await registerWebhooksForShop(req.shop.domain, req.shop.access_token);
+    res.json({ message: 'Webhooks refreshed successfully' });
+  } catch (error) {
+    logger.error('Failed to refresh webhooks:', error);
+    res.status(500).json({ error: 'Failed to refresh webhooks' });
+  }
+});
+
+// Register webhooks helper function
+async function registerWebhooksForShop(shopDomain, accessToken) {
+  const shopify = getShopifyConfig();
+  const session = await createShopifySession(shopDomain, accessToken);
+  
+  const webhookTopics = [
+    'orders/create',
+    'orders/updated', 
+    'orders/cancelled',
+    'fulfillments/create',
+    'fulfillments/updated',
+    'returns/create'
+  ];
+
+  const webhookPath = '/api/webhooks/shopify';
+  const webhookUrl = `${process.env.HOST_URL}${webhookPath}`;
+
+  for (const topic of webhookTopics) {
+    try {
+      const webhook = new shopify.rest.Webhook({ session });
+      webhook.topic = topic;
+      webhook.address = webhookUrl;
+      webhook.format = 'json';
+      
+      await webhook.save({
+        session
+      });
+      
+      logger.info(`Webhook registered: ${topic} for ${shopDomain}`);
+    } catch (error) {
+      // Webhook might already exist, which is fine
+      if (error.response?.body?.errors?.includes('has already been taken')) {
+        logger.info(`Webhook already exists: ${topic} for ${shopDomain}`);
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+module.exports = { router, verifyToken };
