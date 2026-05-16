@@ -1,8 +1,9 @@
+require('@shopify/shopify-api/adapters/node');
 const { shopifyApi, ApiVersion } = require('@shopify/shopify-api');
 const logger = require('../utils/logger');
-
+ 
 let shopifyConfig = null;
-
+ 
 async function initializeShopify() {
   try {
     shopifyConfig = shopifyApi({
@@ -23,7 +24,7 @@ async function initializeShopify() {
       ],
       isEmbeddedApp: true,
     });
-
+ 
     logger.info('Shopify configuration initialized');
     return shopifyConfig;
   } catch (error) {
@@ -31,18 +32,18 @@ async function initializeShopify() {
     throw error;
   }
 }
-
+ 
 function getShopifyConfig() {
   if (!shopifyConfig) {
     throw new Error('Shopify not initialized. Call initializeShopify() first.');
   }
   return shopifyConfig;
 }
-
+ 
 async function createShopifySession(shopDomain, accessToken) {
   const sessionId = `offline_${shopDomain}`;
   const { Session } = require('@shopify/shopify-api');
-
+ 
   const session = new Session({
     id: sessionId,
     shop: shopDomain,
@@ -51,19 +52,19 @@ async function createShopifySession(shopDomain, accessToken) {
     accessToken,
     scope: process.env.SHOPIFY_SCOPES,
   });
-
+ 
   return session;
 }
-
+ 
 async function verifyWebhookHMAC(body, hmacHeader) {
   const crypto = require('crypto');
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_API_SECRET;
-
+ 
   const calculatedHmac = crypto
     .createHmac('sha256', secret)
     .update(body, 'utf8')
     .digest('base64');
-
+ 
   try {
     return crypto.timingSafeEqual(
       Buffer.from(calculatedHmac),
@@ -73,10 +74,10 @@ async function verifyWebhookHMAC(body, hmacHeader) {
     return false;
   }
 }
-
+ 
 module.exports = {
   initializeShopify,
   getShopifyConfig,
   createShopifySession,
-  verifyWebhookHMAC,  // ← fixed: was wrongly exported as verifyWebhook
+  verifyWebhookHMAC,
 };
