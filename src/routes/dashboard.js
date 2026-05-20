@@ -82,6 +82,46 @@ router.get('/overview', async (req, res) => {
   }
 });
 
+// Get dashboard stats
+router.get('/stats', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    const shopDomain = req.shop.domain;
+
+    await supabase.rpc('set_shop_context', { shop_domain: shopDomain });
+
+    const [upsellsResult, returnsResult] = await Promise.all([
+      supabase
+        .from('upsells')
+        .select('offer_price, accepted'),
+      supabase
+        .from('returns')
+        .select('id')
+    ]);
+
+    if (upsellsResult.error) throw upsellsResult.error;
+    if (returnsResult.error) throw returnsResult.error;
+
+    const revenueRecovered = upsellsResult.data
+      ?.filter(u => u.accepted)
+      .reduce((sum, u) => sum + (u.offer_price || 0), 0) || 0;
+
+    const ticketsDeflected = upsellsResult.data
+      ?.filter(u => u.accepted).length || 0;
+
+    const returnsSaved = returnsResult.data?.length || 0;
+
+    res.json({
+      revenueRecovered,
+      ticketsDeflected,
+      returnsSaved
+    });
+  } catch (error) {
+    logger.error('Failed to get dashboard stats:', error);
+    res.status(500).json({ error: 'Failed to load dashboard stats' });
+  }
+});
+
 // Get orders with pagination and filters
 router.get('/orders', async (req, res) => {
   try {
