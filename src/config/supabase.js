@@ -58,24 +58,60 @@ function getSupabaseAdminClient() {
   return supabaseAdmin;
 }
 
-async function createShopRecord(shopDomain, accessToken, scope) {
+async function createShopRecord(shopDomain, accessToken, scope, metadata = {}) {
   const supabaseAdmin = getSupabaseAdminClient();
   
+  const upsertPayload = {
+    domain: shopDomain,
+    access_token: accessToken || '',
+    scope: scope || '',
+    is_active: true,
+    updated_at: new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+
+  if (metadata.email) {
+    upsertPayload.email = metadata.email;
+  }
+
+  if (metadata.passwordHash) {
+    upsertPayload.password_hash = metadata.passwordHash;
+  }
+
+  if (metadata.passwordSalt) {
+    upsertPayload.password_salt = metadata.passwordSalt;
+  }
+
+  if (metadata.storeName) {
+    upsertPayload.store_name = metadata.storeName;
+  }
+
   const { data, error } = await supabaseAdmin
     .from('shops')
-    .upsert({
-      domain: shopDomain,
-      access_token: accessToken,
-      scope: scope,
-      is_active: true,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    })
+    .upsert(upsertPayload)
     .select()
     .single();
 
   if (error) {
     logger.error('Failed to create shop record:', error);
+    throw error;
+  }
+
+  return data;
+}
+ 
+async function getShopByEmail(email) {
+  const supabase = getSupabaseClient();
+
+  const { data, error } = await supabase
+    .from('shops')
+    .select('*')
+    .eq('email', email)
+    .eq('is_active', true)
+    .single();
+
+  if (error && error.code !== 'PGRST116') {
+    logger.error('Failed to get shop by email:', error);
     throw error;
   }
 
@@ -128,6 +164,5 @@ module.exports = {
   getSupabaseClient,
   getSupabaseAdminClient,
   createShopRecord,
-  getShopByDomain,
-  saveWebhookEvent
+  getShopByDomain,  getShopByEmail,  saveWebhookEvent
 };

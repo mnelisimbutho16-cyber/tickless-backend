@@ -2,7 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { getShopifyConfig, createShopifySession } = require('../config/shopify');
-const { createShopRecord, getShopByDomain } = require('../config/supabase');
+const { createShopRecord, getShopByDomain, getShopByEmail } = require('../config/supabase');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -104,6 +104,117 @@ router.get('/shopify/callback', async (req, res) => {
   } catch (error) {
     logger.error('OAuth callback failed:', error);
     res.status(500).json({ error: 'OAuth callback failed' });
+  }
+});
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, hash) {
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(derived, 'hex'),
+    Buffer.from(hash, 'hex')
+  );
+}
+
+// Login with email and password
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const shop = await getShopByEmail(email);
+    if (!shop || !shop.password_hash || !shop.password_salt) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const validPassword = verifyPassword(password, shop.password_salt, shop.password_hash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      {
+        shopDomain: shop.domain,
+        shopId: shop.id,
+        email: shop.email
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      token,
+      shop: {
+        id: shop.id,
+        domain: shop.domain,
+        storeName: shop.store_name,
+        email: shop.email
+      }
+    });
+  } catch (error) {
+    logger.error('Login failed:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Register a new shop account
+router.post('/register', async (req, res) => {
+  try {
+    const { email, password, storeName } = req.body;
+
+    if (!email || !password || !storeName) {
+      return res.status(400).json({ error: 'Email, password, and storeName are required' });
+    }
+
+    const existingShop = await getShopByEmail(email);
+    if (existingShop) {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
+
+    const { salt, hash } = hashPassword(password);
+    const sanitizedDomain = storeName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || `shop-${Date.now()}`;
+    const domain = `${sanitizedDomain}-${Date.now()}.local`;
+
+    const shopRecord = await createShopRecord(domain, '', '', {
+      email,
+      passwordHash: hash,
+      passwordSalt: salt,
+      storeName
+    });
+
+    const token = jwt.sign(
+      {
+        shopDomain: shopRecord.domain,
+        shopId: shopRecord.id,
+        email: shopRecord.email
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.status(201).json({
+      token,
+      shop: {
+        id: shopRecord.id,
+        domain: shopRecord.domain,
+        storeName: shopRecord.store_name,
+        email: shopRecord.email
+      }
+    });
+  } catch (error) {
+    logger.error('Register failed:', error);
+    res.status(500).json({ error: 'Register failed' });
   }
 });
 
