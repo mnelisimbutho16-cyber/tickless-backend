@@ -1,7 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { getShopifyConfig, createShopifySession } = require('../config/shopify');
+const { initializeShopify, getShopifyConfig, createShopifySession } = require('../config/shopify');
 const { createShopRecord, getShopByDomain, getShopByEmail } = require('../config/supabase');
 const logger = require('../utils/logger');
 
@@ -11,7 +11,6 @@ const router = express.Router();
 router.get('/shopify', async (req, res) => {
   try {
     const { shop } = req.query;
-    
     if (!shop) {
       return res.status(400).json({ error: 'Shop parameter is required' });
     }
@@ -22,29 +21,30 @@ router.get('/shopify', async (req, res) => {
       return res.status(400).json({ error: 'Invalid shop domain format' });
     }
 
+    // Ensure Shopify SDK is initialized
+    await initializeShopify();
     const shopify = getShopifyConfig();
-    
+
     // Generate state parameter for security
     const state = crypto.randomBytes(16).toString('hex');
-    
-    // Store state in session or cookie (simplified for this example)
-    res.cookie('oauth_state', state, { 
-      httpOnly: true, 
+
+    // Store state in cookie for verification on callback
+    res.cookie('oauth_state', state, {
+      httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      maxAge: 60000 // 1 minute
+      maxAge: 5 * 60 * 1000 // 5 minutes
     });
 
     // Build authorization URL
     const authUrl = shopify.auth.begin({
       shop,
       callbackPath: '/api/auth/shopify/callback',
-      isOnline: false, // Use offline access tokens for background processing
+      isOnline: false,
       state
     });
 
     logger.info(`OAuth initiated for shop: ${shop}`);
     res.redirect(authUrl);
-    
   } catch (error) {
     logger.error('OAuth initiation failed:', error);
     res.status(500).json({ error: 'Failed to initiate OAuth' });
@@ -55,7 +55,7 @@ router.get('/shopify', async (req, res) => {
 router.get('/shopify/callback', async (req, res) => {
   try {
     const { shop, code, state, hmac } = req.query;
-    const storedState = req.cookies.oauth_state;
+    const storedState = req.cookies?.oauth_state;
 
     // Verify state parameter
     if (!state || state !== storedState) {
@@ -65,8 +65,10 @@ router.get('/shopify/callback', async (req, res) => {
     // Clear the state cookie
     res.clearCookie('oauth_state');
 
+    // Ensure Shopify SDK is initialized
+    await initializeShopify();
     const shopify = getShopifyConfig();
-    
+
     // Exchange code for access token
     const session = await shopify.auth.callback({
       shop,
@@ -76,14 +78,14 @@ router.get('/shopify/callback', async (req, res) => {
 
     // Save shop and token to database
     const shopRecord = await createShopRecord(
-      shop, 
-      session.accessToken, 
+      shop,
+      session.accessToken,
       session.scope
     );
 
     // Generate JWT token for our app
     const appToken = jwt.sign(
-      { 
+      {
         shopDomain: shop,
         shopId: shopRecord.id,
         scopes: session.scope
@@ -96,11 +98,10 @@ router.get('/shopify/callback', async (req, res) => {
     await registerWebhooksForShop(shop, session.accessToken);
 
     logger.info(`OAuth completed for shop: ${shop}`);
-    
-    // Redirect to app with token
-    const redirectUrl = `${process.env.HOST_URL}/app?token=${appToken}&shop=${shop}`;
+
+    // Redirect to dashboard with token
+    const redirectUrl = `${process.env.HOST_URL}/dashboard?token=${appToken}&shop=${shop}`;
     res.redirect(redirectUrl);
-    
   } catch (error) {
     logger.error('OAuth callback failed:', error);
     res.status(500).json({ error: 'OAuth callback failed' });
